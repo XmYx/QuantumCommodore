@@ -1,4 +1,4 @@
-# Brain‑Inspired DIY Photonic Quantum Computer
+# Brain‑Inspired DIY Photonic Quantum Computer idea that if shows potential, might be worth it to build, fix and test.
 
 Welcome! This project brings together optics, electronics, and a dash of neuroscience-inspired thinking to explore quantum computing—right on your workbench. While we’re not (yet) rewriting cryptography or simulating chemistry at scale, this setup lets you build, control, and observe photon‑based qubits in a warm, room‑temperature environment.
 
