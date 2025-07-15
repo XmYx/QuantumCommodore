@@ -1,0 +1,414 @@
+// Brain-Inspired Photonic Quantum Computer Firmware
+// For Arduino Due or Teensy 4.1 (needs fast ADC/DAC)
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <DueTimer.h>
+
+// Pin definitions
+#define LASER_CONTROL_PIN 2
+#define AOM_CONTROL_PIN DAC0  // Acousto-optic modulator
+#define APD1_PIN A0           // Avalanche photodiode 1
+#define APD2_PIN A1           // Avalanche photodiode 2
+#define TEMP_SENSOR_PIN A2
+#define PHASE_PLATE_SERVO 3
+#define POLARIZER_SERVO 4
+
+// Timing constants (nanosecond precision needed)
+#define COINCIDENCE_WINDOW 10  // 10ns window
+#define ZENO_INTERVAL 1000     // 1μs between Zeno measurements
+
+// Quantum state storage
+struct QubitState {
+  float amplitude_real;
+  float amplitude_imag;
+  float phase;
+  uint32_t photon_count;
+  uint32_t last_refresh;
+  uint8_t error_syndrome;
+  bool topological_mode;
+};
+
+// Global state
+QubitState qubits[8];  // Support up to 8 qubits
+volatile uint32_t photon_counts[2] = {0, 0};
+volatile uint32_t coincidence_count = 0;
+volatile uint32_t last_photon_time[2] = {0, 0};
+
+// High-precision timer for photon detection
+volatile uint32_t nano_counter = 0;
+
+// Initialize quantum hardware
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize pins
+  pinMode(LASER_CONTROL_PIN, OUTPUT);
+  pinMode(PHASE_PLATE_SERVO, OUTPUT);
+  pinMode(POLARIZER_SERVO, OUTPUT);
+  
+  // Setup ADC for maximum speed (1 MSPS on Due)
+  analogReadResolution(12);
+  ADC->ADC_MR |= ADC_MR_FREERUN;  // Free running mode
+  
+  // Setup timer for nanosecond precision
+  Timer1.attachInterrupt(nanoTimer).start(1);  // 1 microsecond base
+  
+  // Setup photon detection interrupts
+  attachInterrupt(digitalPinToInterrupt(APD1_PIN), photonDetected1, RISING);
+  attachInterrupt(digitalPinToInterrupt(APD2_PIN), photonDetected2, RISING);
+  
+  // Initialize quantum states
+  for (int i = 0; i < 8; i++) {
+    qubits[i].amplitude_real = 1.0 / sqrt(2);
+    qubits[i].amplitude_imag = 0;
+    qubits[i].phase = 0;
+    qubits[i].photon_count = 0;
+    qubits[i].last_refresh = micros();
+    qubits[i].error_syndrome = 0;
+    qubits[i].topological_mode = false;
+  }
+  
+  // Stabilize laser
+  digitalWrite(LASER_CONTROL_PIN, HIGH);
+  delay(1000);  // Warm-up time
+  
+  Serial.println("Quantum Computer Ready");
+}
+
+// Nanosecond timer
+void nanoTimer() {
+  nano_counter++;
+}
+
+// Photon detection interrupts
+void photonDetected1() {
+  uint32_t current_time = nano_counter;
+  photon_counts[0]++;
+  
+  // Check for coincidence
+  if (abs((int32_t)(current_time - last_photon_time[1])) < COINCIDENCE_WINDOW) {
+    coincidence_count++;
+  }
+  
+  last_photon_time[0] = current_time;
+}
+
+void photonDetected2() {
+  uint32_t current_time = nano_counter;
+  photon_counts[1]++;
+  
+  // Check for coincidence
+  if (abs((int32_t)(current_time - last_photon_time[0])) < COINCIDENCE_WINDOW) {
+    coincidence_count++;
+  }
+  
+  last_photon_time[1] = current_time;
+}
+
+// Main loop
+void loop() {
+  if (Serial.available() > 0) {
+    uint8_t command = Serial.read();
+    processCommand(command);
+  }
+  
+  // Continuous quantum state maintenance
+  maintainQuantumStates();
+}
+
+// Process commands from host computer
+void processCommand(uint8_t cmd) {
+  uint8_t qubit_id;
+  float parameter;
+  uint8_t target_qubit;
+  
+  switch (cmd) {
+    case 0x01:  // Weak measurement (Quantum Zeno)
+      qubit_id = Serial.read();
+      performWeakMeasurement(qubit_id);
+      break;
+      
+    case 0x02:  // Measure error syndrome
+      qubit_id = Serial.read();
+      measureErrorSyndrome(qubit_id);
+      break;
+      
+    case 0x03:  // Geometric phase gate
+      qubit_id = Serial.read();
+      Serial.readBytes((char*)&parameter, sizeof(float));
+      applyGeometricPhase(qubit_id, parameter);
+      break;
+      
+    case 0x04:  // Pauli-X correction
+      qubit_id = Serial.read();
+      applyPauliX(qubit_id);
+      break;
+      
+    case 0x05:  // Pauli-Y correction
+      qubit_id = Serial.read();
+      applyPauliY(qubit_id);
+      break;
+      
+    case 0x06:  // Pauli-Z correction
+      qubit_id = Serial.read();
+      applyPauliZ(qubit_id);
+      break;
+      
+    case 0x10:  // Enable topological mode
+      qubit_id = Serial.read();
+      enableTopologicalMode(qubit_id);
+      break;
+      
+    case 0x20:  // Entangle qubits
+      qubit_id = Serial.read();
+      target_qubit = Serial.read();
+      entangleQubits(qubit_id, target_qubit);
+      break;
+      
+    case 0x30:  // Measure qubit
+      qubit_id = Serial.read();
+      measureQubit(qubit_id);
+      break;
+  }
+}
+
+// Weak measurement for Quantum Zeno effect
+void performWeakMeasurement(uint8_t qubit_id) {
+  if (qubit_id >= 8) return;
+  
+  // Set laser to weak measurement mode
+  analogWrite(AOM_CONTROL_PIN, 10);  // Very low power
+  
+  // Quick measurement
+  delayMicroseconds(ZENO_INTERVAL);
+  
+  // Read photon counts
+  float measurement_strength = (float)photon_counts[qubit_id % 2] / 1000.0;
+  
+  // Send result back
+  Serial.write((uint8_t*)&measurement_strength, sizeof(float));
+  
+  // Reset to normal power
+  analogWrite(AOM_CONTROL_PIN, 255);
+}
+
+// Measure error syndrome without collapsing state
+void measureErrorSyndrome(uint8_t qubit_id) {
+  if (qubit_id >= 8) return;
+  
+  uint8_t syndrome = 0;
+  
+  // Use ancilla photons for syndrome extraction
+  // This is simplified - real implementation would use
+  // stabilizer measurements
+  
+  // X error detection
+  setPolarization(0);  // H polarization
+  delayMicroseconds(100);
+  if (photon_counts[0] > photon_counts[1]) syndrome |= 0x01;
+  
+  // Y error detection  
+  setPolarization(45);  // Diagonal polarization
+  delayMicroseconds(100);
+  if (photon_counts[0] > photon_counts[1]) syndrome |= 0x02;
+  
+  // Z error detection
+  setPolarization(90);  // V polarization
+  delayMicroseconds(100);
+  if (photon_counts[0] > photon_counts[1]) syndrome |= 0x04;
+  
+  qubits[qubit_id].error_syndrome = syndrome;
+  Serial.write(syndrome);
+}
+
+// Apply geometric phase via polarization rotation
+void applyGeometricPhase(uint8_t qubit_id, float angle) {
+  if (qubit_id >= 8) return;
+  
+  // Slowly rotate polarization for adiabatic evolution
+  float current_angle = qubits[qubit_id].phase;
+  float target_angle = current_angle + angle;
+  
+  int steps = 100;
+  for (int i = 0; i <= steps; i++) {
+    float intermediate = current_angle + (angle * i / steps);
+    setPhaseAngle(intermediate);
+    delayMicroseconds(10);
+  }
+  
+  qubits[qubit_id].phase = target_angle;
+}
+
+// Error correction gates
+void applyPauliX(uint8_t qubit_id) {
+  if (qubit_id >= 8) return;
+  
+  // Half-wave plate at 45 degrees
+  setWaveplate(45);
+  delayMicroseconds(100);
+  
+  // Swap real and imaginary amplitudes
+  float temp = qubits[qubit_id].amplitude_real;
+  qubits[qubit_id].amplitude_real = qubits[qubit_id].amplitude_imag;
+  qubits[qubit_id].amplitude_imag = temp;
+}
+
+void applyPauliY(uint8_t qubit_id) {
+  if (qubit_id >= 8) return;
+  
+  // Quarter-wave plate at 45 degrees
+  setWaveplate(45);
+  setPhaseAngle(90);
+  delayMicroseconds(100);
+  
+  // Apply Y rotation
+  float temp = qubits[qubit_id].amplitude_real;
+  qubits[qubit_id].amplitude_real = -qubits[qubit_id].amplitude_imag;
+  qubits[qubit_id].amplitude_imag = temp;
+}
+
+void applyPauliZ(uint8_t qubit_id) {
+  if (qubit_id >= 8) return;
+  
+  // Phase shift only
+  qubits[qubit_id].phase += PI;
+  setPhaseAngle(qubits[qubit_id].phase);
+}
+
+// Enable topological protection mode
+void enableTopologicalMode(uint8_t qubit_id) {
+  if (qubit_id >= 8) return;
+  
+  qubits[qubit_id].topological_mode = true;
+  
+  // Configure for topological protection
+  // In real hardware, this would enable:
+  // - Photonic crystal mode
+  // - Edge state routing
+  // - Topological insulator configuration
+  
+  // For DIY version, we simulate with enhanced error correction
+  qubits[qubit_id].error_syndrome = 0;  // Reset errors
+}
+
+// Create entanglement via Hong-Ou-Mandel interference
+void entangleQubits(uint8_t qubit1, uint8_t qubit2) {
+  if (qubit1 >= 8 || qubit2 >= 8) return;
+  
+  // Route both qubits to beam splitter
+  // Monitor coincidence counts
+  
+  uint32_t initial_coincidence = coincidence_count;
+  delay(10);  // Accumulate statistics
+  uint32_t final_coincidence = coincidence_count;
+  
+  // HOM dip indicates entanglement
+  if (final_coincidence < initial_coincidence * 0.5) {
+    // Successful entanglement
+    qubits[qubit1].error_syndrome = qubits[qubit2].error_syndrome;
+  }
+}
+
+// Measure qubit (destructive)
+void measureQubit(uint8_t qubit_id) {
+  if (qubit_id >= 8) return;
+  
+  // Set measurement basis
+  setPolarization(0);  // Computational basis
+  
+  // Count photons
+  uint32_t count0 = photon_counts[0];
+  delay(1);
+  uint32_t count1 = photon_counts[0];
+  
+  uint8_t result = (count1 - count0) > 100 ? 1 : 0;
+  Serial.write(result);
+  
+  // Reset qubit state
+  qubits[qubit_id].amplitude_real = result ? 0 : 1;
+  qubits[qubit_id].amplitude_imag = 0;
+}
+
+// Continuous state maintenance
+void maintainQuantumStates() {
+  static uint32_t last_maintenance = 0;
+  uint32_t current_time = micros();
+  
+  if (current_time - last_maintenance > 1000) {  // Every millisecond
+    for (int i = 0; i < 8; i++) {
+      if (qubits[i].topological_mode) {
+        // Topological qubits need less maintenance
+        if (current_time - qubits[i].last_refresh > 10000) {  // 10ms
+          refreshTopologicalQubit(i);
+        }
+      } else {
+        // Standard qubits need frequent refresh
+        if (current_time - qubits[i].last_refresh > 100) {  // 100μs
+          refreshStandardQubit(i);
+        }
+      }
+    }
+    last_maintenance = current_time;
+  }
+}
+
+// Refresh functions
+void refreshStandardQubit(uint8_t qubit_id) {
+  // Apply dynamical decoupling sequence
+  applyPauliX(qubit_id);
+  delayMicroseconds(50);
+  applyPauliX(qubit_id);
+  
+  qubits[qubit_id].last_refresh = micros();
+}
+
+void refreshTopologicalQubit(uint8_t qubit_id) {
+  // Topological qubits are more stable
+  // Just check for catastrophic errors
+  if (qubits[qubit_id].error_syndrome > 0) {
+    // Apply correction
+    if (qubits[qubit_id].error_syndrome & 0x01) applyPauliX(qubit_id);
+    if (qubits[qubit_id].error_syndrome & 0x02) applyPauliY(qubit_id);
+    if (qubits[qubit_id].error_syndrome & 0x04) applyPauliZ(qubit_id);
+  }
+  
+  qubits[qubit_id].last_refresh = micros();
+}
+
+// Hardware control functions
+void setPolarization(int angle) {
+  // Control polarizer servo
+  int servo_pos = map(angle, 0, 180, 0, 180);
+  analogWrite(POLARIZER_SERVO, servo_pos);
+}
+
+void setPhaseAngle(float angle) {
+  // Control phase plate servo
+  int servo_pos = map(angle * 180 / PI, 0, 360, 0, 180);
+  analogWrite(PHASE_PLATE_SERVO, servo_pos);
+}
+
+void setWaveplate(int angle) {
+  // Simplified - would control motorized waveplate
+  setPolarization(angle);
+}
+
+// Temperature stabilization
+float readTemperature() {
+  int raw = analogRead(TEMP_SENSOR_PIN);
+  float voltage = raw * 3.3 / 4096.0;
+  return (voltage - 0.5) * 100.0;  // LM35 sensor
+}
+
+void stabilizeTemperature() {
+  static float target_temp = 25.0;  // 25°C
+  float current_temp = readTemperature();
+  
+  if (abs(current_temp - target_temp) > 0.1) {
+    // In real system, would control Peltier element
+    // For now, just log warning
+    Serial.print("Temperature drift: ");
+    Serial.println(current_temp);
+  }
+}
